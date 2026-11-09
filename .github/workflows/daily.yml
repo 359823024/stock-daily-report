@@ -2,9 +2,9 @@ name: A股放量上涨日报
 
 on:
   schedule:
-    # 每个交易日 15:35（北京时间）= 07:35 UTC，周一至周五
-    - cron: '35 7 * * 1-5'
-  workflow_dispatch: {}   # 支持手动触发测试
+    - cron: '35 7 * * 1-5'   # 每交易日 15:35 北京时间
+    - cron: '40 14 * * *'    # 临时测试触发（验证 schedule 是否生效）
+  workflow_dispatch: {}
 
 jobs:
   daily-report:
