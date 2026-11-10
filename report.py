@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""A股「近两日放量上涨」日报 —— 云端定时版
-数据源：新浪财经（免费、免key）
+"""A股「近两日放量上涨」日报 —— 云端定时版 v2
+数据源：东方财富（对海外IP友好）+ 腾讯K线备用
 筛选：近两日连续收涨 + 两日成交量合计 > 前6日均量1.4倍 + 今日量比>1.2
 输出：HTML邮件发送到指定邮箱
 """
@@ -12,48 +12,75 @@ from email.mime.multipart import MIMEMultipart
 from email.header import Header
 import markdown
 
-H = {'Referer': 'https://finance.sina.com.cn', 'User-Agent': 'Mozilla/5.0'}
+UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 SMTP_USER = os.environ['SMTP_USER']
 SMTP_CODE = os.environ['SMTP_AUTH_CODE']
 SMTP_TO = os.environ['SMTP_TO']
 
 
 def fetch_market():
+    """东财全市场A股实时列表，返回 [{symbol, name, price, changepercent}]"""
     rows = []
-    for p in range(1, 60):
-        url = ("http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-               f"Market_Center.getHQNodeData?page={p}&num=100&sort=changepercent&asc=0&node=hs_a")
+    pn = 1
+    while True:
+        url = ("https://push2.eastmoney.com/api/qt/clist/get"
+               f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3"
+               "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+               "&fields=f2,f3,f12,f14")
         try:
-            r = requests.get(url, headers=H, timeout=15)
-            data = json.loads(r.text)
+            d = requests.get(url, headers=UA, timeout=15).json()
         except Exception:
             break
-        if not data:
+        diff = (d.get('data') or {}).get('diff') or []
+        if not diff:
             break
-        rows += data
-        if len(data) < 100:
+        for x in diff:
+            if x.get('f3') == '-' or x.get('f2') == '-':
+                continue
+            code = x['f12']
+            sym = ('sh' if code.startswith('6') else 'sz') + code
+            rows.append({'symbol': sym, 'name': x['f14'],
+                         'changepercent': float(x['f3'])})
+        if len(diff) < 100 or pn >= 60:
             break
+        pn += 1
+        time.sleep(0.3)
     return rows
 
 
 def get_kline(symbol, n=12):
-    u = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/var _=/CN_MarketDataService.getKLineData"
-         f"?symbol={symbol}&scale=240&ma=no&datalen={n}")
-    t = requests.get(u, headers=H, timeout=10).text
-    t = t[t.find('(') + 1:t.rfind(')')]
-    return json.loads(t)
+    """日K线（东财优先，腾讯备用），返回 [{day, close, volume}]，volume统一为股"""
+    mkt = '1' if symbol.startswith('sh') else '0'
+    try:
+        u = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+             f"?secid={mkt}.{symbol[2:]}&klt=101&fqt=0&lmt={n}&end=20500101"
+             "&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57")
+        d = requests.get(u, headers=UA, timeout=12).json()['data']
+        out = []
+        for line in d['klines']:
+            p = line.split(',')
+            out.append({'day': p[0], 'close': float(p[2]), 'volume': float(p[5])})
+        return out
+    except Exception:
+        pass
+    # 腾讯备用
+    u = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,{n},qfq"
+    d = requests.get(u, headers=UA, timeout=12).json()['data'][symbol]
+    arr = d.get('qfqday') or d.get('day')
+    return [{'day': x[0], 'close': float(x[2]), 'volume': float(x[5]) * 100} for x in arr]
 
 
 def scan():
     rows = fetch_market()
     print(f"行情条数: {len(rows)}")
+    if not rows:
+        raise RuntimeError("行情数据为0条，数据源不可用，本次不发送邮件")
     cand = [r for r in rows
-            if r.get('changepercent') is not None
-            and float(r['changepercent']) > 2
-            and float(r['trade']) > 0
-            and not r['symbol'].startswith(('sh688', 'sz30', 'bj'))
-            and 'ST' not in r['name']]
-    cand = sorted(cand, key=lambda x: -float(x['changepercent']))[:80]
+            if r['changepercent'] > 2
+            and not r['symbol'][2:].startswith(('688', '689', '300', '301', '302', '8', '4', '92'))
+            and 'ST' not in r['name'].upper()
+            and not r['name'].startswith(('N', 'C', 'U', 'W'))]
+    cand = sorted(cand, key=lambda x: -x['changepercent'])[:80]
     print(f"今日涨幅>2%候选: {len(cand)}")
 
     res = []
@@ -62,14 +89,16 @@ def scan():
             d = get_kline(r['symbol'])
             if len(d) < 9:
                 continue
-            c1, c2, c3 = float(d[-1]['close']), float(d[-2]['close']), float(d[-3]['close'])
-            v1, v2 = float(d[-1]['volume']), float(d[-2]['volume'])
-            vavg = sum(float(x['volume']) for x in d[-8:-2]) / 6
+            c1, c2, c3 = d[-1]['close'], d[-2]['close'], d[-3]['close']
+            v1, v2 = d[-1]['volume'], d[-2]['volume']
+            vavg = sum(x['volume'] for x in d[-8:-2]) / 6
+            if vavg <= 0:
+                continue
             r1, r2 = v1 / vavg, v2 / vavg
             if c1 > c2 and c2 > c3 and r1 > 1.2 and r2 > 1.0 and (v1 + v2) / (2 * vavg) > 1.4:
                 res.append({
-                    '代码': r['symbol'], '名称': r['name'], '最新价': c1,
-                    '今日涨幅%': round(float(r['changepercent']), 2),
+                    '代码': r['symbol'][2:], '名称': r['name'], '最新价': c1,
+                    '今日涨幅%': round(r['changepercent'], 2),
                     '昨日涨幅%': round((c2 / c3 - 1) * 100, 2),
                     '今日量比': round(r1, 2), '昨日量比': round(r2, 2),
                     '合计放量': round((v1 + v2) / (2 * vavg), 2),
@@ -133,7 +162,6 @@ def send(md_text, subject):
     html = f"""<html><body style="font-family:Microsoft YaHei,Arial;max-width:860px;">
 <style>table{{border-collapse:collapse;font-size:14px;}}th,td{{border:1px solid #ccc;padding:6px 10px;}}
 th{{background:#f0f0f0;}}</style>{body}
-<p style="color:#999;font-size:12px;">本邮件由云端定时任务自动发送，仅为数据统计，不构成投资建议。</p>
 </body></html>"""
     msg = MIMEMultipart()
     msg['From'] = SMTP_USER
@@ -150,6 +178,6 @@ th{{background:#f0f0f0;}}</style>{body}
 if __name__ == '__main__':
     df = scan()
     md_text = build_md(df)
-    print(md_text[:500])
+    print(md_text[:400])
     date0 = df['日期'].iloc[0] if not df.empty else str(datetime.date.today())
     send(md_text, f"A股「近两日放量上涨」日报 {date0}（{len(df)}只）")
