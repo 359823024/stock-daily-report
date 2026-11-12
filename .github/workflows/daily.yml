@@ -1,9 +1,7 @@
 name: A股放量上涨日报
 
 on:
-  schedule:
-    - cron: '35 7 * * 1-5'   # 每交易日 15:35 北京时间（GitHub 调度不可靠，主用外部定时器触发）
-  workflow_dispatch: {}       # 外部定时器通过 API 调用此入口
+  workflow_dispatch: {}   # 由 cron-job.org 每交易日15:35(北京时间)调用触发
 
 jobs:
   daily-report:
