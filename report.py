@@ -18,33 +18,60 @@ SMTP_CODE = os.environ['SMTP_AUTH_CODE']
 SMTP_TO = os.environ['SMTP_TO']
 
 
-def fetch_market():
-    """东财全市场A股实时列表，返回 [{symbol, name, price, changepercent}]"""
-    rows = []
-    pn = 1
-    while True:
-        url = ("https://push2.eastmoney.com/api/qt/clist/get"
+EM_HOSTS = ['push2.eastmoney.com', '82.push2.eastmoney.com',
+            '99.push2.eastmoney.com', '23.push2.eastmoney.com']
+
+
+def fetch_page(pn, host_seed):
+    """带重试的单页行情，返回diff列表或空"""
+    for rt in range(3):
+        host = EM_HOSTS[(host_seed + pn + rt) % len(EM_HOSTS)]
+        url = (f"https://{host}/api/qt/clist/get"
                f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3"
                "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
                "&fields=f2,f3,f12,f14")
         try:
             d = requests.get(url, headers=UA, timeout=15).json()
+            diff = (d.get('data') or {}).get('diff') or []
+            if diff:
+                return diff
         except Exception:
-            break
-        diff = (d.get('data') or {}).get('diff') or []
-        if not diff:
-            break
-        for x in diff:
-            if x.get('f3') == '-' or x.get('f2') == '-':
-                continue
-            code = x['f12']
-            sym = ('sh' if code.startswith('6') else 'sz') + code
-            rows.append({'symbol': sym, 'name': x['f14'],
-                         'changepercent': float(x['f3'])})
-        if len(diff) < 100 or pn >= 60:
-            break
-        pn += 1
-        time.sleep(0.3)
+            pass
+        time.sleep(2 + rt * 2)
+    return []
+
+
+def fetch_market():
+    """东财全市场A股实时列表。列表按涨幅降序，只翻页到涨幅<2%为止，
+    大幅减少请求量以避免触发限流。"""
+    for attempt in range(4):
+        rows = []
+        pn = 1
+        while pn <= 20:
+            diff = fetch_page(pn, attempt * 2)
+            if not diff:
+                break
+            for x in diff:
+                if x.get('f3') == '-' or x.get('f2') == '-':
+                    continue
+                code = x['f12']
+                sym = ('sh' if code.startswith('6') else 'sz') + code
+                rows.append({'symbol': sym, 'name': x['f14'],
+                             'changepercent': float(x['f3'])})
+            # 已翻到涨幅2%以下，无需继续（候选只需>2%）
+            tail = diff[-1].get('f3')
+            if isinstance(tail, (int, float)) and tail < 2:
+                break
+            if len(diff) < 100:
+                break
+            pn += 1
+            time.sleep(1)
+        if len(rows) >= 50:
+            if attempt > 0:
+                print(f"第{attempt+1}轮重试成功")
+            return rows
+        print(f"第{attempt+1}轮仅获取{len(rows)}条，15秒后换节点重试")
+        time.sleep(15)
     return rows
 
 
